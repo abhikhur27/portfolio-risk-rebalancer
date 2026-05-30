@@ -1,4 +1,4 @@
-﻿# Portfolio Risk Rebalancer (Python)
+# Portfolio Risk Rebalancer (Python)
 
 Python CLI tool that converts a current holdings snapshot into an inverse-volatility rebalancing plan.
 
@@ -61,3 +61,9 @@ If `--output-plan` is provided, it also writes a CSV with actionable trade rows.
 - This is a planning utility, not investment advice.
 - Volatility estimates should come from your own data pipeline.
 - Fractional share output is supported for brokerages that allow it.
+
+## Portfolio Positioning
+
+- Project type: Python command-line utility
+- Verification path: python rebalance.py --help and run sample_positions.csv through the CLI.
+
