@@ -12,6 +12,8 @@ When a portfolio drifts, it is easy to over-concentrate in high-volatility names
 
 It returns target weights, target value per position, and share deltas.
 
+Realistically this doesnt need to be an independent repo as it is part of my main workflow. But the main workflow is currently private.
+
 ## Input CSV format
 
 Required columns:
