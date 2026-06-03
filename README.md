@@ -39,6 +39,12 @@ TLT,18,92.10,0.17
 python rebalance.py --input sample_positions.csv
 ```
 
+Suppress tiny trades that are not worth placing manually:
+
+```bash
+python rebalance.py --input sample_positions.csv --min-trade-value 50
+```
+
 Include fresh cash and export a machine-readable trade plan:
 
 ```bash

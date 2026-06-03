@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build an inverse-volatility portfolio rebalance plan.")
     parser.add_argument("--input", type=Path, required=True, help="CSV with symbol, shares, price, annual_volatility")
     parser.add_argument("--cash", type=float, default=0.0, help="Optional additional cash to allocate")
+    parser.add_argument(
+        "--min-trade-value",
+        type=float,
+        default=0.0,
+        help="Suppress trade recommendations smaller than this dollar threshold and report the residual drift",
+    )
     parser.add_argument("--output-plan", type=Path, help="Optional CSV output path for the generated trade plan")
     return parser.parse_args()
 
@@ -58,9 +64,15 @@ def read_positions(csv_path: Path) -> list[Position]:
     return rows
 
 
-def compute_targets(positions: list[Position], extra_cash: float) -> list[dict[str, float | str]]:
+def compute_targets(
+    positions: list[Position],
+    extra_cash: float,
+    min_trade_value: float = 0.0,
+) -> list[dict[str, float | str]]:
     if extra_cash < 0:
         raise ValueError("cash cannot be negative.")
+    if min_trade_value < 0:
+        raise ValueError("min-trade-value cannot be negative.")
 
     total_current_value = sum(item.current_value for item in positions)
     total_target_value = total_current_value + extra_cash
@@ -74,6 +86,8 @@ def compute_targets(positions: list[Position], extra_cash: float) -> list[dict[s
         target_value = total_target_value * target_weight
         value_delta = target_value - item.current_value
         share_delta = value_delta / item.price
+        actionable_value_delta = 0.0 if abs(value_delta) < min_trade_value else value_delta
+        actionable_share_delta = actionable_value_delta / item.price
 
         plan.append(
             {
@@ -86,16 +100,21 @@ def compute_targets(positions: list[Position], extra_cash: float) -> list[dict[s
                 "target_value": target_value,
                 "value_delta": value_delta,
                 "share_delta": share_delta,
+                "actionable_value_delta": actionable_value_delta,
+                "actionable_share_delta": actionable_share_delta,
             }
         )
 
     return plan
 
 
-def print_report(plan: list[dict[str, float | str]], extra_cash: float) -> None:
+def print_report(plan: list[dict[str, float | str]], extra_cash: float, min_trade_value: float) -> None:
     total_current = sum(float(row["current_value"]) for row in plan)
     total_target = total_current + extra_cash
-    gross_turnover = sum(abs(float(row["value_delta"])) for row in plan) / 2.0
+    gross_turnover = sum(abs(float(row["actionable_value_delta"])) for row in plan) / 2.0
+    suppressed_value = sum(
+        abs(float(row["value_delta"]) - float(row["actionable_value_delta"])) for row in plan
+    ) / 2.0
 
     print("Portfolio Risk Rebalancer")
     print("=" * 28)
@@ -103,11 +122,14 @@ def print_report(plan: list[dict[str, float | str]], extra_cash: float) -> None:
     print(f"Extra cash:             ${extra_cash:,.2f}")
     print(f"Target portfolio value: ${total_target:,.2f}")
     print(f"Estimated turnover:     ${gross_turnover:,.2f}")
+    if min_trade_value > 0:
+        print(f"Trade threshold:        ${min_trade_value:,.2f}")
+        print(f"Suppressed drift:       ${suppressed_value:,.2f}")
     print()
 
     header = (
         f"{'Symbol':<8} {'CurValue':>12} {'TgtWeight':>10} {'TgtValue':>12} "
-        f"{'Delta$':>12} {'DeltaSh':>12}"
+        f"{'Action$':>12} {'ActionSh':>12}"
     )
     print(header)
     print("-" * len(header))
@@ -118,8 +140,8 @@ def print_report(plan: list[dict[str, float | str]], extra_cash: float) -> None:
             f"{float(row['current_value']):>12.2f} "
             f"{float(row['target_weight']) * 100:>9.2f}% "
             f"{float(row['target_value']):>12.2f} "
-            f"{float(row['value_delta']):>12.2f} "
-            f"{float(row['share_delta']):>12.4f}"
+            f"{float(row['actionable_value_delta']):>12.2f} "
+            f"{float(row['actionable_share_delta']):>12.4f}"
         )
 
 
@@ -134,6 +156,8 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
         "target_value",
         "value_delta",
         "share_delta",
+        "actionable_value_delta",
+        "actionable_share_delta",
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
@@ -146,8 +170,8 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
 def main() -> None:
     args = parse_args()
     positions = read_positions(args.input)
-    plan = compute_targets(positions, extra_cash=args.cash)
-    print_report(plan, extra_cash=args.cash)
+    plan = compute_targets(positions, extra_cash=args.cash, min_trade_value=args.min_trade_value)
+    print_report(plan, extra_cash=args.cash, min_trade_value=args.min_trade_value)
 
     if args.output_plan:
         write_plan_csv(plan, args.output_plan)
