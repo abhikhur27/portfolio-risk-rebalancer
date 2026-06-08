@@ -39,6 +39,12 @@ TLT,18,92.10,0.17
 python rebalance.py --input sample_positions.csv
 ```
 
+Add a trade floor and concentration warning:
+
+```bash
+python rebalance.py --input sample_positions.csv --min-trade-value 50 --concentration-threshold 0.30
+```
+
 Suppress tiny trades that are not worth placing manually:
 
 ```bash

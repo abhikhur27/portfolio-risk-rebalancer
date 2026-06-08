@@ -28,6 +28,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Suppress trade recommendations smaller than this dollar threshold and report the residual drift",
     )
+    parser.add_argument(
+        "--concentration-threshold",
+        type=float,
+        default=0.35,
+        help="Warn when current or target portfolio weight exceeds this fraction.",
+    )
     parser.add_argument("--output-plan", type=Path, help="Optional CSV output path for the generated trade plan")
     return parser.parse_args()
 
@@ -96,19 +102,27 @@ def compute_targets(
                 "price": item.price,
                 "annual_volatility": item.annual_volatility,
                 "current_value": item.current_value,
+                "current_weight": item.current_value / total_current_value if total_current_value else 0.0,
                 "target_weight": target_weight,
                 "target_value": target_value,
                 "value_delta": value_delta,
                 "share_delta": share_delta,
                 "actionable_value_delta": actionable_value_delta,
                 "actionable_share_delta": actionable_share_delta,
+                "weight_drift_pct": (target_weight - (item.current_value / total_current_value if total_current_value else 0.0))
+                * 100.0,
             }
         )
 
     return plan
 
 
-def print_report(plan: list[dict[str, float | str]], extra_cash: float, min_trade_value: float) -> None:
+def print_report(
+    plan: list[dict[str, float | str]],
+    extra_cash: float,
+    min_trade_value: float,
+    concentration_threshold: float,
+) -> None:
     total_current = sum(float(row["current_value"]) for row in plan)
     total_target = total_current + extra_cash
     gross_turnover = sum(abs(float(row["actionable_value_delta"])) for row in plan) / 2.0
@@ -125,10 +139,11 @@ def print_report(plan: list[dict[str, float | str]], extra_cash: float, min_trad
     if min_trade_value > 0:
         print(f"Trade threshold:        ${min_trade_value:,.2f}")
         print(f"Suppressed drift:       ${suppressed_value:,.2f}")
+    print(f"Concentration watch:    {concentration_threshold * 100:.1f}%")
     print()
 
     header = (
-        f"{'Symbol':<8} {'CurValue':>12} {'TgtWeight':>10} {'TgtValue':>12} "
+        f"{'Symbol':<8} {'CurWgt':>8} {'TgtWgt':>8} {'Drift':>9} {'TgtValue':>12} "
         f"{'Action$':>12} {'ActionSh':>12}"
     )
     print(header)
@@ -137,12 +152,26 @@ def print_report(plan: list[dict[str, float | str]], extra_cash: float, min_trad
     for row in sorted(plan, key=lambda item: str(item["symbol"])):
         print(
             f"{str(row['symbol']):<8} "
-            f"{float(row['current_value']):>12.2f} "
+            f"{float(row['current_weight']) * 100:>7.2f}% "
             f"{float(row['target_weight']) * 100:>9.2f}% "
+            f"{float(row['weight_drift_pct']):>8.2f}% "
             f"{float(row['target_value']):>12.2f} "
             f"{float(row['actionable_value_delta']):>12.2f} "
             f"{float(row['actionable_share_delta']):>12.4f}"
         )
+
+    concentration_rows = [
+        row
+        for row in plan
+        if float(row["current_weight"]) >= concentration_threshold or float(row["target_weight"]) >= concentration_threshold
+    ]
+    if concentration_rows:
+        print("\nConcentration watch:")
+        for row in sorted(concentration_rows, key=lambda item: float(item["target_weight"]), reverse=True):
+            print(
+                f"  {row['symbol']}: current {float(row['current_weight']) * 100:.2f}% -> "
+                f"target {float(row['target_weight']) * 100:.2f}%"
+            )
 
 
 def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> None:
@@ -152,12 +181,14 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
         "price",
         "annual_volatility",
         "current_value",
+        "current_weight",
         "target_weight",
         "target_value",
         "value_delta",
         "share_delta",
         "actionable_value_delta",
         "actionable_share_delta",
+        "weight_drift_pct",
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
@@ -171,7 +202,12 @@ def main() -> None:
     args = parse_args()
     positions = read_positions(args.input)
     plan = compute_targets(positions, extra_cash=args.cash, min_trade_value=args.min_trade_value)
-    print_report(plan, extra_cash=args.cash, min_trade_value=args.min_trade_value)
+    print_report(
+        plan,
+        extra_cash=args.cash,
+        min_trade_value=args.min_trade_value,
+        concentration_threshold=args.concentration_threshold,
+    )
 
     if args.output_plan:
         write_plan_csv(plan, args.output_plan)
