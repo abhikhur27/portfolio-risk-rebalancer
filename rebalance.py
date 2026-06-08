@@ -109,6 +109,7 @@ def compute_targets(
                 "share_delta": share_delta,
                 "actionable_value_delta": actionable_value_delta,
                 "actionable_share_delta": actionable_share_delta,
+                "trade_action": "BUY" if actionable_value_delta > 0 else "SELL" if actionable_value_delta < 0 else "HOLD",
                 "weight_drift_pct": (target_weight - (item.current_value / total_current_value if total_current_value else 0.0))
                 * 100.0,
             }
@@ -129,6 +130,8 @@ def print_report(
     suppressed_value = sum(
         abs(float(row["value_delta"]) - float(row["actionable_value_delta"])) for row in plan
     ) / 2.0
+    total_buys = sum(max(float(row["actionable_value_delta"]), 0.0) for row in plan)
+    total_sells = sum(max(-float(row["actionable_value_delta"]), 0.0) for row in plan)
 
     print("Portfolio Risk Rebalancer")
     print("=" * 28)
@@ -136,6 +139,8 @@ def print_report(
     print(f"Extra cash:             ${extra_cash:,.2f}")
     print(f"Target portfolio value: ${total_target:,.2f}")
     print(f"Estimated turnover:     ${gross_turnover:,.2f}")
+    print(f"Buy flow:               ${total_buys:,.2f}")
+    print(f"Sell flow:              ${total_sells:,.2f}")
     if min_trade_value > 0:
         print(f"Trade threshold:        ${min_trade_value:,.2f}")
         print(f"Suppressed drift:       ${suppressed_value:,.2f}")
@@ -143,7 +148,7 @@ def print_report(
     print()
 
     header = (
-        f"{'Symbol':<8} {'CurWgt':>8} {'TgtWgt':>8} {'Drift':>9} {'TgtValue':>12} "
+        f"{'Symbol':<8} {'Action':<6} {'CurWgt':>8} {'TgtWgt':>8} {'Drift':>9} {'TgtValue':>12} "
         f"{'Action$':>12} {'ActionSh':>12}"
     )
     print(header)
@@ -152,6 +157,7 @@ def print_report(
     for row in sorted(plan, key=lambda item: str(item["symbol"])):
         print(
             f"{str(row['symbol']):<8} "
+            f"{str(row['trade_action']):<6} "
             f"{float(row['current_weight']) * 100:>7.2f}% "
             f"{float(row['target_weight']) * 100:>9.2f}% "
             f"{float(row['weight_drift_pct']):>8.2f}% "
@@ -188,6 +194,7 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
         "share_delta",
         "actionable_value_delta",
         "actionable_share_delta",
+        "trade_action",
         "weight_drift_pct",
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)

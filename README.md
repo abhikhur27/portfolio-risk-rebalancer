@@ -64,6 +64,8 @@ The CLI prints:
 - total current value
 - target risk-balanced weights
 - per-symbol value and share deltas
+- explicit `BUY` / `SELL` / `HOLD` action labels
+- gross buy and sell flow totals
 - gross turnover estimate
 
 If `--output-plan` is provided, it also writes a CSV with actionable trade rows.
