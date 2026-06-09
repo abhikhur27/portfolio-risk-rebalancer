@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,7 @@ def parse_args() -> argparse.Namespace:
         help="Warn when current or target portfolio weight exceeds this fraction.",
     )
     parser.add_argument("--output-plan", type=Path, help="Optional CSV output path for the generated trade plan")
+    parser.add_argument("--summary-output", type=Path, help="Optional JSON path for high-level rebalance totals")
     return parser.parse_args()
 
 
@@ -205,6 +207,38 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
             writer.writerow(row)
 
 
+def write_summary_json(
+    plan: list[dict[str, float | str]],
+    output_path: Path,
+    *,
+    extra_cash: float,
+    concentration_threshold: float,
+) -> None:
+    total_current = sum(float(row["current_value"]) for row in plan)
+    total_target = total_current + extra_cash
+    concentration_watch = [
+        {
+            "symbol": str(row["symbol"]),
+            "current_weight": round(float(row["current_weight"]), 4),
+            "target_weight": round(float(row["target_weight"]), 4),
+        }
+        for row in plan
+        if float(row["current_weight"]) >= concentration_threshold or float(row["target_weight"]) >= concentration_threshold
+    ]
+    payload = {
+        "current_portfolio_value": round(total_current, 2),
+        "target_portfolio_value": round(total_target, 2),
+        "extra_cash": round(extra_cash, 2),
+        "gross_turnover": round(sum(abs(float(row["actionable_value_delta"])) for row in plan) / 2.0, 2),
+        "buy_flow": round(sum(max(float(row["actionable_value_delta"]), 0.0) for row in plan), 2),
+        "sell_flow": round(sum(max(-float(row["actionable_value_delta"]), 0.0) for row in plan), 2),
+        "concentration_threshold": concentration_threshold,
+        "concentration_watch": concentration_watch,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def main() -> None:
     args = parse_args()
     positions = read_positions(args.input)
@@ -220,6 +254,15 @@ def main() -> None:
         write_plan_csv(plan, args.output_plan)
         print()
         print(f"Wrote trade plan: {args.output_plan}")
+
+    if args.summary_output:
+        write_summary_json(
+            plan,
+            args.summary_output,
+            extra_cash=args.cash,
+            concentration_threshold=args.concentration_threshold,
+        )
+        print(f"Wrote rebalance summary: {args.summary_output}")
 
 
 if __name__ == "__main__":
