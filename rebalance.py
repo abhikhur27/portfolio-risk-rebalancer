@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         default=0.35,
         help="Warn when current or target portfolio weight exceeds this fraction.",
     )
+    parser.add_argument(
+        "--max-target-weight",
+        type=float,
+        help="Optional hard cap on any target portfolio weight as a fraction, with the remainder redistributed.",
+    )
     parser.add_argument("--output-plan", type=Path, help="Optional CSV output path for the generated trade plan")
     parser.add_argument("--summary-output", type=Path, help="Optional JSON path for high-level rebalance totals")
     return parser.parse_args()
@@ -76,21 +81,57 @@ def compute_targets(
     positions: list[Position],
     extra_cash: float,
     min_trade_value: float = 0.0,
+    max_target_weight: float | None = None,
 ) -> list[dict[str, float | str]]:
     if extra_cash < 0:
         raise ValueError("cash cannot be negative.")
     if min_trade_value < 0:
         raise ValueError("min-trade-value cannot be negative.")
+    if max_target_weight is not None and not 0 < max_target_weight <= 1:
+        raise ValueError("max-target-weight must be between 0 and 1.")
 
     total_current_value = sum(item.current_value for item in positions)
     total_target_value = total_current_value + extra_cash
 
     inv_vol = [1.0 / item.annual_volatility for item in positions]
     inv_vol_sum = sum(inv_vol)
+    raw_target_weights = [component / inv_vol_sum for component in inv_vol]
+    target_weights = raw_target_weights
+
+    if max_target_weight is not None:
+        if max_target_weight * len(positions) < 1 - 1e-9:
+            raise ValueError("max-target-weight is too small to allocate the full portfolio across the input positions.")
+
+        target_weights = [0.0 for _ in positions]
+        uncapped = set(range(len(positions)))
+        remaining_weight = 1.0
+
+        while uncapped:
+            inv_pool = sum(inv_vol[index] for index in uncapped)
+            if inv_pool <= 0:
+                equal_share = remaining_weight / len(uncapped)
+                for index in uncapped:
+                    target_weights[index] = equal_share
+                break
+
+            capped_this_round = []
+            for index in list(uncapped):
+                proposed = remaining_weight * (inv_vol[index] / inv_pool)
+                if proposed > max_target_weight + 1e-9:
+                    target_weights[index] = max_target_weight
+                    remaining_weight -= max_target_weight
+                    capped_this_round.append(index)
+
+            if not capped_this_round:
+                for index in uncapped:
+                    target_weights[index] = remaining_weight * (inv_vol[index] / inv_pool)
+                break
+
+            for index in capped_this_round:
+                uncapped.remove(index)
 
     plan: list[dict[str, float | str]] = []
-    for item, inv_component in zip(positions, inv_vol):
-        target_weight = inv_component / inv_vol_sum
+    for item, raw_target_weight, target_weight in zip(positions, raw_target_weights, target_weights):
         target_value = total_target_value * target_weight
         value_delta = target_value - item.current_value
         share_delta = value_delta / item.price
@@ -105,6 +146,7 @@ def compute_targets(
                 "annual_volatility": item.annual_volatility,
                 "current_value": item.current_value,
                 "current_weight": item.current_value / total_current_value if total_current_value else 0.0,
+                "raw_target_weight": raw_target_weight,
                 "target_weight": target_weight,
                 "target_value": target_value,
                 "value_delta": value_delta,
@@ -112,6 +154,7 @@ def compute_targets(
                 "actionable_value_delta": actionable_value_delta,
                 "actionable_share_delta": actionable_share_delta,
                 "trade_action": "BUY" if actionable_value_delta > 0 else "SELL" if actionable_value_delta < 0 else "HOLD",
+                "cap_applied": "yes" if max_target_weight is not None and target_weight + 1e-9 < raw_target_weight else "no",
                 "weight_drift_pct": (target_weight - (item.current_value / total_current_value if total_current_value else 0.0))
                 * 100.0,
             }
@@ -125,6 +168,7 @@ def print_report(
     extra_cash: float,
     min_trade_value: float,
     concentration_threshold: float,
+    max_target_weight: float | None,
 ) -> None:
     total_current = sum(float(row["current_value"]) for row in plan)
     total_target = total_current + extra_cash
@@ -147,10 +191,12 @@ def print_report(
         print(f"Trade threshold:        ${min_trade_value:,.2f}")
         print(f"Suppressed drift:       ${suppressed_value:,.2f}")
     print(f"Concentration watch:    {concentration_threshold * 100:.1f}%")
+    if max_target_weight is not None:
+        print(f"Target weight cap:      {max_target_weight * 100:.1f}%")
     print()
 
     header = (
-        f"{'Symbol':<8} {'Action':<6} {'CurWgt':>8} {'TgtWgt':>8} {'Drift':>9} {'TgtValue':>12} "
+        f"{'Symbol':<8} {'Action':<6} {'CurWgt':>8} {'TgtWgt':>8} {'Cap':>5} {'Drift':>9} {'TgtValue':>12} "
         f"{'Action$':>12} {'ActionSh':>12}"
     )
     print(header)
@@ -162,6 +208,7 @@ def print_report(
             f"{str(row['trade_action']):<6} "
             f"{float(row['current_weight']) * 100:>7.2f}% "
             f"{float(row['target_weight']) * 100:>9.2f}% "
+            f"{str(row['cap_applied']):>5} "
             f"{float(row['weight_drift_pct']):>8.2f}% "
             f"{float(row['target_value']):>12.2f} "
             f"{float(row['actionable_value_delta']):>12.2f} "
@@ -190,6 +237,7 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
         "annual_volatility",
         "current_value",
         "current_weight",
+        "raw_target_weight",
         "target_weight",
         "target_value",
         "value_delta",
@@ -197,6 +245,7 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
         "actionable_value_delta",
         "actionable_share_delta",
         "trade_action",
+        "cap_applied",
         "weight_drift_pct",
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,6 +262,7 @@ def write_summary_json(
     *,
     extra_cash: float,
     concentration_threshold: float,
+    max_target_weight: float | None,
 ) -> None:
     total_current = sum(float(row["current_value"]) for row in plan)
     total_target = total_current + extra_cash
@@ -233,6 +283,7 @@ def write_summary_json(
         "buy_flow": round(sum(max(float(row["actionable_value_delta"]), 0.0) for row in plan), 2),
         "sell_flow": round(sum(max(-float(row["actionable_value_delta"]), 0.0) for row in plan), 2),
         "concentration_threshold": concentration_threshold,
+        "max_target_weight": round(max_target_weight, 4) if max_target_weight is not None else None,
         "concentration_watch": concentration_watch,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -242,12 +293,18 @@ def write_summary_json(
 def main() -> None:
     args = parse_args()
     positions = read_positions(args.input)
-    plan = compute_targets(positions, extra_cash=args.cash, min_trade_value=args.min_trade_value)
+    plan = compute_targets(
+        positions,
+        extra_cash=args.cash,
+        min_trade_value=args.min_trade_value,
+        max_target_weight=args.max_target_weight,
+    )
     print_report(
         plan,
         extra_cash=args.cash,
         min_trade_value=args.min_trade_value,
         concentration_threshold=args.concentration_threshold,
+        max_target_weight=args.max_target_weight,
     )
 
     if args.output_plan:
@@ -261,6 +318,7 @@ def main() -> None:
             args.summary_output,
             extra_cash=args.cash,
             concentration_threshold=args.concentration_threshold,
+            max_target_weight=args.max_target_weight,
         )
         print(f"Wrote rebalance summary: {args.summary_output}")
 

@@ -57,6 +57,12 @@ Include fresh cash and export a machine-readable trade plan:
 python rebalance.py --input sample_positions.csv --cash 1500 --output-plan trade_plan.csv
 ```
 
+Cap any single target weight when the pure inverse-volatility result gets too concentrated:
+
+```bash
+python rebalance.py --input sample_positions.csv --cash 1500 --max-target-weight 0.28
+```
+
 ## Output
 
 The CLI prints:
@@ -67,6 +73,7 @@ The CLI prints:
 - explicit `BUY` / `SELL` / `HOLD` action labels
 - gross buy and sell flow totals
 - gross turnover estimate
+- optional hard caps on target weights with redistribution across the remaining names
 
 If `--output-plan` is provided, it also writes a CSV with actionable trade rows.
 
