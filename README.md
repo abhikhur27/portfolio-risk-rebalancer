@@ -63,16 +63,23 @@ Cap any single target weight when the pure inverse-volatility result gets too co
 python rebalance.py --input sample_positions.csv --cash 1500 --max-target-weight 0.28
 ```
 
+Constrain how much total trading the plan is allowed to do and leave the rest of the cash uncommitted:
+
+```bash
+python rebalance.py --input sample_positions.csv --cash 1500 --max-trade-notional 900
+```
+
 ## Output
 
 The CLI prints:
 
 - total current value
-- target risk-balanced weights
+- recommended target weights after any budget cap
 - per-symbol value and share deltas
 - explicit `BUY` / `SELL` / `HOLD` action labels
 - gross buy and sell flow totals
-- gross turnover estimate
+- total trade notional
+- optional deployed-cash / unused-cash split when a trade-notional budget is applied
 - optional hard caps on target weights with redistribution across the remaining names
 
 If `--output-plan` is provided, it also writes a CSV with actionable trade rows.

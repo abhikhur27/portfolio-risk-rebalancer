@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Optional hard cap on any target portfolio weight as a fraction, with the remainder redistributed.",
     )
+    parser.add_argument(
+        "--max-trade-notional",
+        type=float,
+        help="Optional cap on total absolute trade dollars; the plan will scale toward the target until it fits this budget.",
+    )
     parser.add_argument("--output-plan", type=Path, help="Optional CSV output path for the generated trade plan")
     parser.add_argument("--summary-output", type=Path, help="Optional JSON path for high-level rebalance totals")
     return parser.parse_args()
@@ -82,6 +87,7 @@ def compute_targets(
     extra_cash: float,
     min_trade_value: float = 0.0,
     max_target_weight: float | None = None,
+    max_trade_notional: float | None = None,
 ) -> list[dict[str, float | str]]:
     if extra_cash < 0:
         raise ValueError("cash cannot be negative.")
@@ -89,6 +95,8 @@ def compute_targets(
         raise ValueError("min-trade-value cannot be negative.")
     if max_target_weight is not None and not 0 < max_target_weight <= 1:
         raise ValueError("max-target-weight must be between 0 and 1.")
+    if max_trade_notional is not None and max_trade_notional < 0:
+        raise ValueError("max-trade-notional cannot be negative.")
 
     total_current_value = sum(item.current_value for item in positions)
     total_target_value = total_current_value + extra_cash
@@ -130,15 +138,13 @@ def compute_targets(
             for index in capped_this_round:
                 uncapped.remove(index)
 
-    plan: list[dict[str, float | str]] = []
+    pre_budget_rows: list[dict[str, float | str]] = []
     for item, raw_target_weight, target_weight in zip(positions, raw_target_weights, target_weights):
         target_value = total_target_value * target_weight
         value_delta = target_value - item.current_value
         share_delta = value_delta / item.price
-        actionable_value_delta = 0.0 if abs(value_delta) < min_trade_value else value_delta
-        actionable_share_delta = actionable_value_delta / item.price
 
-        plan.append(
+        pre_budget_rows.append(
             {
                 "symbol": item.symbol,
                 "shares": item.shares,
@@ -151,12 +157,41 @@ def compute_targets(
                 "target_value": target_value,
                 "value_delta": value_delta,
                 "share_delta": share_delta,
+                "cap_applied": "yes" if max_target_weight is not None and target_weight + 1e-9 < raw_target_weight else "no",
+            }
+        )
+
+    raw_trade_notional = sum(abs(float(row["value_delta"])) for row in pre_budget_rows)
+    trade_budget_scale = 1.0
+    if max_trade_notional is not None and raw_trade_notional > 0 and raw_trade_notional > max_trade_notional:
+        trade_budget_scale = max_trade_notional / raw_trade_notional
+
+    deployed_cash = extra_cash * trade_budget_scale
+    recommended_total_value = total_current_value + deployed_cash
+    plan: list[dict[str, float | str]] = []
+    for row in pre_budget_rows:
+        budgeted_value_delta = float(row["value_delta"]) * trade_budget_scale
+        budgeted_share_delta = budgeted_value_delta / float(row["price"])
+        actionable_value_delta = 0.0 if abs(budgeted_value_delta) < min_trade_value else budgeted_value_delta
+        actionable_share_delta = actionable_value_delta / float(row["price"])
+        recommended_target_value = float(row["current_value"]) + budgeted_value_delta
+        recommended_target_weight = (
+            recommended_target_value / recommended_total_value if recommended_total_value else 0.0
+        )
+
+        plan.append(
+            {
+                **row,
+                "recommended_target_value": recommended_target_value,
+                "recommended_target_weight": recommended_target_weight,
+                "budgeted_value_delta": budgeted_value_delta,
+                "budgeted_share_delta": budgeted_share_delta,
                 "actionable_value_delta": actionable_value_delta,
                 "actionable_share_delta": actionable_share_delta,
                 "trade_action": "BUY" if actionable_value_delta > 0 else "SELL" if actionable_value_delta < 0 else "HOLD",
-                "cap_applied": "yes" if max_target_weight is not None and target_weight + 1e-9 < raw_target_weight else "no",
-                "weight_drift_pct": (target_weight - (item.current_value / total_current_value if total_current_value else 0.0))
-                * 100.0,
+                "trade_budget_scale": trade_budget_scale,
+                "unused_cash": extra_cash - deployed_cash,
+                "weight_drift_pct": (recommended_target_weight - float(row["current_weight"])) * 100.0,
             }
         )
 
@@ -169,13 +204,15 @@ def print_report(
     min_trade_value: float,
     concentration_threshold: float,
     max_target_weight: float | None,
+    max_trade_notional: float | None,
 ) -> None:
     total_current = sum(float(row["current_value"]) for row in plan)
-    total_target = total_current + extra_cash
-    gross_turnover = sum(abs(float(row["actionable_value_delta"])) for row in plan) / 2.0
+    deployed_cash = extra_cash * (float(plan[0]["trade_budget_scale"]) if plan else 1.0)
+    total_target = total_current + deployed_cash
+    trade_notional = sum(abs(float(row["actionable_value_delta"])) for row in plan)
     suppressed_value = sum(
-        abs(float(row["value_delta"]) - float(row["actionable_value_delta"])) for row in plan
-    ) / 2.0
+        abs(float(row["budgeted_value_delta"]) - float(row["actionable_value_delta"])) for row in plan
+    )
     total_buys = sum(max(float(row["actionable_value_delta"]), 0.0) for row in plan)
     total_sells = sum(max(-float(row["actionable_value_delta"]), 0.0) for row in plan)
 
@@ -183,8 +220,9 @@ def print_report(
     print("=" * 28)
     print(f"Current portfolio value: ${total_current:,.2f}")
     print(f"Extra cash:             ${extra_cash:,.2f}")
-    print(f"Target portfolio value: ${total_target:,.2f}")
-    print(f"Estimated turnover:     ${gross_turnover:,.2f}")
+    print(f"Deployed cash:          ${deployed_cash:,.2f}")
+    print(f"Recommended value:      ${total_target:,.2f}")
+    print(f"Trade notional:         ${trade_notional:,.2f}")
     print(f"Buy flow:               ${total_buys:,.2f}")
     print(f"Sell flow:              ${total_sells:,.2f}")
     if min_trade_value > 0:
@@ -193,10 +231,15 @@ def print_report(
     print(f"Concentration watch:    {concentration_threshold * 100:.1f}%")
     if max_target_weight is not None:
         print(f"Target weight cap:      {max_target_weight * 100:.1f}%")
+    if max_trade_notional is not None:
+        scale = float(plan[0]["trade_budget_scale"]) if plan else 1.0
+        print(f"Trade budget:           ${max_trade_notional:,.2f}")
+        print(f"Budget scale applied:   {scale * 100:.1f}%")
+        print(f"Unused cash:            ${extra_cash - deployed_cash:,.2f}")
     print()
 
     header = (
-        f"{'Symbol':<8} {'Action':<6} {'CurWgt':>8} {'TgtWgt':>8} {'Cap':>5} {'Drift':>9} {'TgtValue':>12} "
+        f"{'Symbol':<8} {'Action':<6} {'CurWgt':>8} {'TgtWgt':>8} {'Cap':>5} {'Drift':>9} {'RecValue':>12} "
         f"{'Action$':>12} {'ActionSh':>12}"
     )
     print(header)
@@ -207,10 +250,10 @@ def print_report(
             f"{str(row['symbol']):<8} "
             f"{str(row['trade_action']):<6} "
             f"{float(row['current_weight']) * 100:>7.2f}% "
-            f"{float(row['target_weight']) * 100:>9.2f}% "
+            f"{float(row['recommended_target_weight']) * 100:>9.2f}% "
             f"{str(row['cap_applied']):>5} "
             f"{float(row['weight_drift_pct']):>8.2f}% "
-            f"{float(row['target_value']):>12.2f} "
+            f"{float(row['recommended_target_value']):>12.2f} "
             f"{float(row['actionable_value_delta']):>12.2f} "
             f"{float(row['actionable_share_delta']):>12.4f}"
         )
@@ -218,14 +261,14 @@ def print_report(
     concentration_rows = [
         row
         for row in plan
-        if float(row["current_weight"]) >= concentration_threshold or float(row["target_weight"]) >= concentration_threshold
+        if float(row["current_weight"]) >= concentration_threshold or float(row["recommended_target_weight"]) >= concentration_threshold
     ]
     if concentration_rows:
         print("\nConcentration watch:")
-        for row in sorted(concentration_rows, key=lambda item: float(item["target_weight"]), reverse=True):
+        for row in sorted(concentration_rows, key=lambda item: float(item["recommended_target_weight"]), reverse=True):
             print(
                 f"  {row['symbol']}: current {float(row['current_weight']) * 100:.2f}% -> "
-                f"target {float(row['target_weight']) * 100:.2f}%"
+                f"target {float(row['recommended_target_weight']) * 100:.2f}%"
             )
 
 
@@ -240,12 +283,18 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
         "raw_target_weight",
         "target_weight",
         "target_value",
+        "recommended_target_weight",
+        "recommended_target_value",
         "value_delta",
         "share_delta",
+        "budgeted_value_delta",
+        "budgeted_share_delta",
         "actionable_value_delta",
         "actionable_share_delta",
         "trade_action",
         "cap_applied",
+        "trade_budget_scale",
+        "unused_cash",
         "weight_drift_pct",
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +312,7 @@ def write_summary_json(
     extra_cash: float,
     concentration_threshold: float,
     max_target_weight: float | None,
+    max_trade_notional: float | None,
 ) -> None:
     total_current = sum(float(row["current_value"]) for row in plan)
     total_target = total_current + extra_cash
@@ -270,20 +320,24 @@ def write_summary_json(
         {
             "symbol": str(row["symbol"]),
             "current_weight": round(float(row["current_weight"]), 4),
-            "target_weight": round(float(row["target_weight"]), 4),
+            "target_weight": round(float(row["recommended_target_weight"]), 4),
         }
         for row in plan
-        if float(row["current_weight"]) >= concentration_threshold or float(row["target_weight"]) >= concentration_threshold
+        if float(row["current_weight"]) >= concentration_threshold or float(row["recommended_target_weight"]) >= concentration_threshold
     ]
     payload = {
         "current_portfolio_value": round(total_current, 2),
-        "target_portfolio_value": round(total_target, 2),
+        "recommended_portfolio_value": round(sum(float(row["recommended_target_value"]) for row in plan), 2),
         "extra_cash": round(extra_cash, 2),
-        "gross_turnover": round(sum(abs(float(row["actionable_value_delta"])) for row in plan) / 2.0, 2),
+        "deployed_cash": round(extra_cash * (float(plan[0]["trade_budget_scale"]) if plan else 1.0), 2),
+        "trade_notional": round(sum(abs(float(row["actionable_value_delta"])) for row in plan), 2),
         "buy_flow": round(sum(max(float(row["actionable_value_delta"]), 0.0) for row in plan), 2),
         "sell_flow": round(sum(max(-float(row["actionable_value_delta"]), 0.0) for row in plan), 2),
         "concentration_threshold": concentration_threshold,
         "max_target_weight": round(max_target_weight, 4) if max_target_weight is not None else None,
+        "max_trade_notional": round(max_trade_notional, 2) if max_trade_notional is not None else None,
+        "trade_budget_scale": round(float(plan[0]["trade_budget_scale"]) if plan else 1.0, 4),
+        "unused_cash": round(float(plan[0]["unused_cash"]) if plan else 0.0, 2),
         "concentration_watch": concentration_watch,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,6 +352,7 @@ def main() -> None:
         extra_cash=args.cash,
         min_trade_value=args.min_trade_value,
         max_target_weight=args.max_target_weight,
+        max_trade_notional=args.max_trade_notional,
     )
     print_report(
         plan,
@@ -305,6 +360,7 @@ def main() -> None:
         min_trade_value=args.min_trade_value,
         concentration_threshold=args.concentration_threshold,
         max_target_weight=args.max_target_weight,
+        max_trade_notional=args.max_trade_notional,
     )
 
     if args.output_plan:
@@ -319,6 +375,7 @@ def main() -> None:
             extra_cash=args.cash,
             concentration_threshold=args.concentration_threshold,
             max_target_weight=args.max_target_weight,
+            max_trade_notional=args.max_trade_notional,
         )
         print(f"Wrote rebalance summary: {args.summary_output}")
 
