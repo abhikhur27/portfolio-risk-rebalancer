@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Optional cap on total absolute trade dollars; the plan will scale toward the target until it fits this budget.",
     )
+    parser.add_argument(
+        "--share-rounding",
+        choices=("fractional", "half", "whole"),
+        default="fractional",
+        help="Round actionable share deltas to brokerage-friendly increments.",
+    )
     parser.add_argument("--output-plan", type=Path, help="Optional CSV output path for the generated trade plan")
     parser.add_argument("--summary-output", type=Path, help="Optional JSON path for high-level rebalance totals")
     return parser.parse_args()
@@ -88,6 +94,7 @@ def compute_targets(
     min_trade_value: float = 0.0,
     max_target_weight: float | None = None,
     max_trade_notional: float | None = None,
+    share_rounding: str = "fractional",
 ) -> list[dict[str, float | str]]:
     if extra_cash < 0:
         raise ValueError("cash cannot be negative.")
@@ -97,6 +104,8 @@ def compute_targets(
         raise ValueError("max-target-weight must be between 0 and 1.")
     if max_trade_notional is not None and max_trade_notional < 0:
         raise ValueError("max-trade-notional cannot be negative.")
+    if share_rounding not in {"fractional", "half", "whole"}:
+        raise ValueError("share-rounding must be fractional, half, or whole.")
 
     total_current_value = sum(item.current_value for item in positions)
     total_target_value = total_current_value + extra_cash
@@ -172,18 +181,25 @@ def compute_targets(
     for row in pre_budget_rows:
         budgeted_value_delta = float(row["value_delta"]) * trade_budget_scale
         budgeted_share_delta = budgeted_value_delta / float(row["price"])
-        actionable_value_delta = 0.0 if abs(budgeted_value_delta) < min_trade_value else budgeted_value_delta
-        actionable_share_delta = actionable_value_delta / float(row["price"])
+        if abs(budgeted_value_delta) < min_trade_value:
+            actionable_share_delta = 0.0
+        else:
+            actionable_share_delta = round_share_delta(budgeted_share_delta, share_rounding)
+        actionable_value_delta = actionable_share_delta * float(row["price"])
         recommended_target_value = float(row["current_value"]) + budgeted_value_delta
         recommended_target_weight = (
             recommended_target_value / recommended_total_value if recommended_total_value else 0.0
         )
+        rounded_target_value = float(row["current_value"]) + actionable_value_delta
+        rounded_target_weight = rounded_target_value / recommended_total_value if recommended_total_value else 0.0
 
         plan.append(
             {
                 **row,
                 "recommended_target_value": recommended_target_value,
                 "recommended_target_weight": recommended_target_weight,
+                "rounded_target_value": rounded_target_value,
+                "rounded_target_weight": rounded_target_weight,
                 "budgeted_value_delta": budgeted_value_delta,
                 "budgeted_share_delta": budgeted_share_delta,
                 "actionable_value_delta": actionable_value_delta,
@@ -192,10 +208,22 @@ def compute_targets(
                 "trade_budget_scale": trade_budget_scale,
                 "unused_cash": extra_cash - deployed_cash,
                 "weight_drift_pct": (recommended_target_weight - float(row["current_weight"])) * 100.0,
+                "rounded_weight_drift_pct": (rounded_target_weight - float(row["current_weight"])) * 100.0,
+                "rounding_mode": share_rounding,
+                "rounding_value_slippage": actionable_value_delta - budgeted_value_delta,
             }
         )
 
     return plan
+
+
+def round_share_delta(share_delta: float, mode: str) -> float:
+    if mode == "fractional":
+        return share_delta
+
+    step = 0.5 if mode == "half" else 1.0
+    rounded = round(abs(share_delta) / step) * step
+    return rounded if share_delta >= 0 else -rounded
 
 
 def print_report(
@@ -205,6 +233,7 @@ def print_report(
     concentration_threshold: float,
     max_target_weight: float | None,
     max_trade_notional: float | None,
+    share_rounding: str,
 ) -> None:
     total_current = sum(float(row["current_value"]) for row in plan)
     deployed_cash = extra_cash * (float(plan[0]["trade_budget_scale"]) if plan else 1.0)
@@ -213,6 +242,7 @@ def print_report(
     suppressed_value = sum(
         abs(float(row["budgeted_value_delta"]) - float(row["actionable_value_delta"])) for row in plan
     )
+    rounding_slippage = sum(float(row["rounding_value_slippage"]) for row in plan)
     total_buys = sum(max(float(row["actionable_value_delta"]), 0.0) for row in plan)
     total_sells = sum(max(-float(row["actionable_value_delta"]), 0.0) for row in plan)
 
@@ -225,9 +255,12 @@ def print_report(
     print(f"Trade notional:         ${trade_notional:,.2f}")
     print(f"Buy flow:               ${total_buys:,.2f}")
     print(f"Sell flow:              ${total_sells:,.2f}")
+    print(f"Share rounding:         {share_rounding}")
     if min_trade_value > 0:
         print(f"Trade threshold:        ${min_trade_value:,.2f}")
         print(f"Suppressed drift:       ${suppressed_value:,.2f}")
+    if share_rounding != "fractional":
+        print(f"Rounding slippage:      ${rounding_slippage:,.2f}")
     print(f"Concentration watch:    {concentration_threshold * 100:.1f}%")
     if max_target_weight is not None:
         print(f"Target weight cap:      {max_target_weight * 100:.1f}%")
@@ -250,10 +283,10 @@ def print_report(
             f"{str(row['symbol']):<8} "
             f"{str(row['trade_action']):<6} "
             f"{float(row['current_weight']) * 100:>7.2f}% "
-            f"{float(row['recommended_target_weight']) * 100:>9.2f}% "
+            f"{float(row['rounded_target_weight']) * 100:>9.2f}% "
             f"{str(row['cap_applied']):>5} "
-            f"{float(row['weight_drift_pct']):>8.2f}% "
-            f"{float(row['recommended_target_value']):>12.2f} "
+            f"{float(row['rounded_weight_drift_pct']):>8.2f}% "
+            f"{float(row['rounded_target_value']):>12.2f} "
             f"{float(row['actionable_value_delta']):>12.2f} "
             f"{float(row['actionable_share_delta']):>12.4f}"
         )
@@ -268,7 +301,7 @@ def print_report(
         for row in sorted(concentration_rows, key=lambda item: float(item["recommended_target_weight"]), reverse=True):
             print(
                 f"  {row['symbol']}: current {float(row['current_weight']) * 100:.2f}% -> "
-                f"target {float(row['recommended_target_weight']) * 100:.2f}%"
+                f"target {float(row['rounded_target_weight']) * 100:.2f}%"
             )
 
 
@@ -285,6 +318,8 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
         "target_value",
         "recommended_target_weight",
         "recommended_target_value",
+        "rounded_target_weight",
+        "rounded_target_value",
         "value_delta",
         "share_delta",
         "budgeted_value_delta",
@@ -296,6 +331,9 @@ def write_plan_csv(plan: list[dict[str, float | str]], output_path: Path) -> Non
         "trade_budget_scale",
         "unused_cash",
         "weight_drift_pct",
+        "rounded_weight_drift_pct",
+        "rounding_mode",
+        "rounding_value_slippage",
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
@@ -320,10 +358,10 @@ def write_summary_json(
         {
             "symbol": str(row["symbol"]),
             "current_weight": round(float(row["current_weight"]), 4),
-            "target_weight": round(float(row["recommended_target_weight"]), 4),
+            "target_weight": round(float(row["rounded_target_weight"]), 4),
         }
         for row in plan
-        if float(row["current_weight"]) >= concentration_threshold or float(row["recommended_target_weight"]) >= concentration_threshold
+        if float(row["current_weight"]) >= concentration_threshold or float(row["rounded_target_weight"]) >= concentration_threshold
     ]
     payload = {
         "current_portfolio_value": round(total_current, 2),
@@ -331,6 +369,8 @@ def write_summary_json(
         "extra_cash": round(extra_cash, 2),
         "deployed_cash": round(extra_cash * (float(plan[0]["trade_budget_scale"]) if plan else 1.0), 2),
         "trade_notional": round(sum(abs(float(row["actionable_value_delta"])) for row in plan), 2),
+        "rounding_mode": str(plan[0]["rounding_mode"]) if plan else "fractional",
+        "rounding_value_slippage": round(sum(float(row["rounding_value_slippage"]) for row in plan), 2),
         "buy_flow": round(sum(max(float(row["actionable_value_delta"]), 0.0) for row in plan), 2),
         "sell_flow": round(sum(max(-float(row["actionable_value_delta"]), 0.0) for row in plan), 2),
         "concentration_threshold": concentration_threshold,
@@ -353,6 +393,7 @@ def main() -> None:
         min_trade_value=args.min_trade_value,
         max_target_weight=args.max_target_weight,
         max_trade_notional=args.max_trade_notional,
+        share_rounding=args.share_rounding,
     )
     print_report(
         plan,
@@ -361,6 +402,7 @@ def main() -> None:
         concentration_threshold=args.concentration_threshold,
         max_target_weight=args.max_target_weight,
         max_trade_notional=args.max_trade_notional,
+        share_rounding=args.share_rounding,
     )
 
     if args.output_plan:

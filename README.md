@@ -69,6 +69,12 @@ Constrain how much total trading the plan is allowed to do and leave the rest of
 python rebalance.py --input sample_positions.csv --cash 1500 --max-trade-notional 900
 ```
 
+Round trades to whole shares when a brokerage or manual workflow does not support precise fractional sizing:
+
+```bash
+python rebalance.py --input sample_positions.csv --cash 1500 --share-rounding whole
+```
+
 ## Output
 
 The CLI prints:
@@ -81,6 +87,7 @@ The CLI prints:
 - total trade notional
 - optional deployed-cash / unused-cash split when a trade-notional budget is applied
 - optional hard caps on target weights with redistribution across the remaining names
+- optional half-share or whole-share rounding with explicit rounding slippage
 
 If `--output-plan` is provided, it also writes a CSV with actionable trade rows.
 
